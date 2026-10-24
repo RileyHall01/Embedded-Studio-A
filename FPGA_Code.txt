@@ -1,0 +1,98 @@
+// ============================================================================
+// accel_top.v
+// Top level for the accelerometer + activity-detection subsystem.
+// MOVEMENT output is a single bit: 1 when moving, 0 when stationary.
+// All eight LEDs light together while movement is detected.
+// Raw X/Y/Z and the movement flag are also streamed over UART for plotting.
+//
+// TUNING: raise THRESHOLD below if the LEDs trigger while the board sits
+// still, lower it if gentle movement is missed. Units are ADXL345 LSBs
+// at 256 LSB/g:
+//   32  = ~0.13 g  (very sensitive - flickered on a desk during testing)
+//   64  = ~0.25 g  (set here)
+//   96  = ~0.38 g
+//   192 = ~0.75 g  (only clear movement)
+// ============================================================================
+module accel_top (
+    input  wire        CLOCK_50,
+    input  wire        KEY0,          // active-low reset pushbutton
+
+    // ADXL345 (DE0-Nano shared I2C/SPI pins)
+    output wire        G_SENSOR_CS_N,
+    output wire        I2C_SCLK,
+    inout  wire        I2C_SDAT,
+
+    output wire [7:0]  LED,
+
+    // Single-bit activity output for the rest of the system (spec #8):
+    // 1 = movement, 0 = stationary. GPIO_0 header pin 4 (PIN_C3).
+    output wire        MOVEMENT,
+
+    // UART to PC via USB-serial adapter: GPIO_0 header pin 2 (PIN_D3), 115200 8N1
+    output wire        UART_TXD
+);
+
+    wire rst_n = KEY0;
+
+    wire signed [15:0] ax, ay, az;
+    wire        dv;
+    wire        moving;
+    wire [15:0] level;   // activity magnitude, available for future use
+
+    adxl345_ctrl #(
+        .CLK_HZ   (50_000_000),
+        .SAMPLE_HZ(100)
+    ) u_ctrl (
+        .clk(CLOCK_50), .rst_n(rst_n),
+        .accel_x(ax), .accel_y(ay), .accel_z(az), .data_valid(dv),
+        .spi_csn(G_SENSOR_CS_N), .spi_sclk(I2C_SCLK), .spi_sdio(I2C_SDAT)
+    );
+
+    activity_detect #(
+        .THRESHOLD   (16'd64),    // ~0.25 g - trips MOVEMENT / LED0
+        .ON_COUNT    (4'd3),      // 3 consecutive samples (30 ms) before triggering
+        .HOLD_SAMPLES(8'd100)     // stays on 1 s after the last movement
+    ) u_act (
+        .clk(CLOCK_50), .rst_n(rst_n), .data_valid(dv),
+        .accel_x(ax), .accel_y(ay), .accel_z(az),
+        .moving(moving), .activity_level(level)
+    );
+	 
+	 reg [3:0] uart_sample_count = 0;
+reg uart_data_valid = 0;
+
+always @(posedge CLOCK_50 or negedge rst_n) begin
+    if (!rst_n) begin
+        uart_sample_count <= 0;
+        uart_data_valid <= 0;
+    end else begin
+        uart_data_valid <= 0;
+
+        if (dv) begin
+            if (uart_sample_count == 9) begin
+                uart_sample_count <= 0;
+                uart_data_valid <= 1;
+            end else begin
+                uart_sample_count <= uart_sample_count + 1'b1;
+            end
+        end
+    end
+end
+
+    // Streams "x,y,z,moving\n" as ASCII at 100 lines/s. moving = 0 or 200 so the
+    // flag is visible on the same axes as the accel data in a serial plotter.
+    serial_plot #(
+        .CLK_HZ(50_000_000), .BAUD(9600), .MOVING_LEVEL(16'd200)
+    ) u_plot (
+        .clk(CLOCK_50), .rst_n(rst_n), .data_valid(uart_data_valid),
+        .accel_x(ax), .accel_y(ay), .accel_z(az), .moving(moving),
+        .txd(UART_TXD)
+    );
+
+    // Single-bit output for the rest of the system: movement or no movement
+    assign MOVEMENT = moving;
+
+    // All eight LEDs light together when movement is detected
+    assign LED = {8{moving}};
+
+endmodule

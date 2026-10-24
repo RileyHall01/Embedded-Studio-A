@@ -1,0 +1,51 @@
+
+#include <SoftwareSerial.h>
+
+// FPGA UART connection
+SoftwareSerial fpgaSerial(2, 3);
+
+unsigned long lastRateCheck = 0;
+unsigned long packetCount = 0;
+
+void setup() {
+  Serial.begin(115200);      // Arduino -> PC
+  fpgaSerial.begin(9600);    // FPGA -> Arduino
+
+  Serial.println("Arduino FPGA receiver ready");
+
+  lastRateCheck = millis();
+}
+
+void loop() {
+
+  // Read incoming FPGA data
+  while (fpgaSerial.available()) {
+    char c = fpgaSerial.read();
+
+    // Forward data to PC
+    Serial.write(c);
+
+    // Count complete lines (packets)
+    if (c == '\n') {
+      packetCount++;
+    }
+  }
+
+  // Calculate sample rate every second
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastRateCheck >= 1000) {
+
+    float elapsedSeconds =
+      (currentTime - lastRateCheck) / 1000.0;
+
+    float sampleRate = packetCount / elapsedSeconds;
+
+    Serial.print("Sample Rate: ");
+    Serial.print(sampleRate, 1);
+    Serial.println(" Hz");
+
+    packetCount = 0;
+    lastRateCheck = currentTime;
+  }
+}
