@@ -1,0 +1,416 @@
+// ============================================================================
+// ecg_hr.v
+// AD8232 ECG -> heart rate (BPM) for the DE0-Nano health monitor.
+//
+//   adc128s022_reader - reads one channel of the DE0-Nano's onboard 12-bit
+//                       ADC at SAMPLE_HZ (200 Hz).
+//   hr_detect         - finds R-peaks in the sample stream and outputs BPM.
+//
+// Signal chain inside hr_detect (all integer maths, one pass per sample):
+//   1. 4-sample moving average at 200 Hz. This puts a notch at exactly
+//      50 Hz (and 100 Hz), so Australian mains hum is removed. For a 60 Hz
+//      region, change the sample rate / averaging length.
+//   2. Slow baseline estimate (about 1.3 s time constant) subtracted so the
+//      DC offset and slow drift of the AD8232 output do not matter.
+//   3. Adaptive threshold = 62.5 % of a running average of recent R-peak
+//      heights (never below MIN_THR counts). The first 2 s after the leads
+//      are attached are used to learn the initial peak height.
+//   4. 250 ms refractory period after each beat so the T-wave is ignored.
+//   5. BPM = 60 / average of the last (up to) 4 beat-to-beat intervals.
+//      Intervals that are far from the average are rejected as false or
+//      missed beats; a sustained change re-acquires the rate.
+//
+// Expect a valid BPM about 5-6 s after the electrodes are attached, and up to
+// ~10 s to settle if the signal was absent for a long time beforehand.
+// This is a hobby-grade detector, not a medical device.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// adc128s022_reader
+// ----------------------------------------------------------------------------
+// ADC128S022 on the DE0-Nano: 16 SCLK cycles per conversion.
+//   - channel address (3 bits) is sent on SADDR during SCLK cycles 2, 3, 4
+//   - result is 4 leading zeros then 12 data bits, MSB first, read on the
+//     rising SCLK edges (the 16-bit word is shifted in, low 12 bits kept)
+// SCLK idles high; here it runs at CLK_HZ / (2 * SCLK_HALF) = 2.5 MHz
+// (device range 0.8 - 3.2 MHz).
+// The address you send selects the channel of the NEXT conversion, so the
+// very first sample after reset comes from channel 0. That is harmless here
+// because hr_detect's learning phase ignores it.
+// ----------------------------------------------------------------------------
+module adc128s022_reader #(
+    parameter CLK_HZ     = 50_000_000,
+    parameter SAMPLE_HZ  = 200,
+    parameter SCLK_HALF  = 10,          // clock cycles per SCLK half-period
+    parameter [2:0] CHANNEL = 3'd0      // ADC input channel 0-7
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    output reg         adc_cs_n,
+    output reg         adc_sclk,
+    output reg         adc_saddr,       // FPGA -> ADC (channel select)
+    input  wire        adc_sdat,        // ADC -> FPGA (conversion result)
+
+    output reg  [11:0] sample,
+    output reg         sample_valid     // 1-clock pulse per new sample
+);
+
+    localparam integer PACE_CLKS = CLK_HZ / SAMPLE_HZ;
+
+    reg [19:0] pace_cnt;
+    reg        busy;
+    reg [7:0]  half_cnt;
+    reg [4:0]  e;                        // edge counter 0..31 (even = falling)
+    reg [15:0] shreg;
+
+    wire start = (pace_cnt == PACE_CLKS - 1);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            adc_cs_n     <= 1'b1;
+            adc_sclk     <= 1'b1;
+            adc_saddr    <= 1'b0;
+            sample       <= 12'd0;
+            sample_valid <= 1'b0;
+            pace_cnt     <= 20'd0;
+            busy         <= 1'b0;
+            half_cnt     <= 8'd0;
+            e            <= 5'd0;
+            shreg        <= 16'd0;
+        end else begin
+            sample_valid <= 1'b0;
+
+            if (start) pace_cnt <= 20'd0;
+            else       pace_cnt <= pace_cnt + 1'b1;
+
+            if (!busy) begin
+                if (start) begin
+                    busy     <= 1'b1;
+                    adc_cs_n <= 1'b0;
+                    half_cnt <= 8'd0;
+                    e        <= 5'd0;
+                end
+            end else if (half_cnt == SCLK_HALF - 1) begin
+                half_cnt <= 8'd0;
+                e        <= e + 1'b1;
+                if (!e[0]) begin
+                    // falling edge, start of SCLK cycle (e[4:1] + 1)
+                    adc_sclk <= 1'b0;
+                    case (e[4:1])
+                        4'd1:    adc_saddr <= CHANNEL[2];   // cycle 2
+                        4'd2:    adc_saddr <= CHANNEL[1];   // cycle 3
+                        4'd3:    adc_saddr <= CHANNEL[0];   // cycle 4
+                        default: adc_saddr <= 1'b0;
+                    endcase
+                end else begin
+                    // rising edge: ADC data is stable, shift it in
+                    adc_sclk <= 1'b1;
+                    shreg    <= {shreg[14:0], adc_sdat};
+                    if (e == 5'd31) begin
+                        adc_cs_n     <= 1'b1;
+                        busy         <= 1'b0;
+                        sample       <= {shreg[10:0], adc_sdat};
+                        sample_valid <= 1'b1;
+                    end
+                end
+            end else begin
+                half_cnt <= half_cnt + 1'b1;
+            end
+        end
+    end
+
+endmodule
+
+
+// ----------------------------------------------------------------------------
+// hr_detect
+// ----------------------------------------------------------------------------
+module hr_detect #(
+    parameter CLK_HZ    = 50_000_000,
+    parameter SAMPLE_HZ = 200,          // must match the ADC reader
+    parameter MIN_THR   = 24            // lowest detection threshold, ADC counts
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire [11:0] sample,          // AD8232 output, 12-bit ADC counts
+    input  wire        sample_valid,    // 1-clock pulse per sample
+    input  wire        leads_off,       // AD8232 LO+ OR LO- (high = electrode off)
+
+    output reg  [7:0]  bpm,             // heart rate, 0 when not valid
+    output reg         bpm_valid,
+    output reg         beat,            // 1-clock pulse at each detected beat
+    output wire        beat_led         // beat stretched to ~100 ms for an LED
+);
+
+    // All timing constants scale from SAMPLE_HZ (values below are for 200 Hz)
+    localparam integer REFRACT   = SAMPLE_HZ / 4;     // 250 ms  (max 240 bpm)
+    localparam integer PULSE_MAX = SAMPLE_HZ / 5;     // 200 ms
+    localparam integer LEARN     = SAMPLE_HZ * 2;     // 2 s
+    localparam integer RR_MAX    = SAMPLE_HZ * 2;     // 2 s     (min 30 bpm)
+    localparam integer NOBEAT    = SAMPLE_HZ * 3;     // 3 s without a beat
+    localparam integer DIV_K     = SAMPLE_HZ * 60;
+    localparam [11:0]  MIN_THR_W = MIN_THR;
+
+    // ---------------- state ----------------
+    reg               lo_m, lo_s;            // leads-off synchroniser
+    reg               init;                  // first sample after (re)attach
+    reg        [11:0] x1, x2, x3;            // moving-average history
+    reg        [19:0] base_acc;              // baseline, 8 fractional bits
+    reg         [9:0] learn_cnt;
+    reg signed [13:0] learn_max;
+    reg        [15:0] pk_q;                  // average R height, 4 fractional bits
+    reg         [9:0] rr_cnt;                // samples since last beat (sat. 1023)
+    reg               have_prev;
+    reg         [7:0] refr;
+    reg               in_pulse, upd;
+    reg         [7:0] plen;
+    reg signed [13:0] pk_cur;
+    reg         [9:0] rr0, rr1, rr2, rr3;    // last four accepted intervals
+    reg         [2:0] rr_n;
+    reg         [2:0] rej;                   // mismatch score
+    reg         [1:0] dstate;
+    reg        [16:0] rem;
+    reg        [11:0] den;
+    reg         [7:0] q;
+    reg        [22:0] led_cnt;
+
+    localparam [1:0] D_IDLE = 2'd0, D_LOAD = 2'd1, D_RUN = 2'd2;
+
+    // ---------------- signal path (combinational) ----------------
+    always @(posedge clk) begin
+        lo_m <= leads_off;
+        lo_s <= lo_m;
+    end
+
+    wire        [13:0] sum4 = sample + x1 + x2 + x3;
+    wire        [11:0] y    = init ? sample : sum4[13:2];
+
+    wire signed [20:0] base_err  = $signed({1'b0, y, 8'b0}) - $signed({1'b0, base_acc});
+    wire signed [20:0] base_next = init ? $signed({1'b0, y, 8'b0})
+                                        : $signed({1'b0, base_acc}) + (base_err >>> 8);
+    wire signed [13:0] hp = $signed({2'b00, y}) - $signed({2'b00, base_next[19:8]});
+
+    // threshold
+    wire        [15:0] thr_q   = (pk_q >> 1) + (pk_q >> 3);     // 62.5 % of pk_q
+    wire        [11:0] thr_raw = thr_q[15:4];
+    wire        [11:0] thr     = (thr_raw < MIN_THR_W) ? MIN_THR_W : thr_raw;
+    wire signed [13:0] thr_s   = $signed({2'b00, thr});
+
+    // counters for this sample
+    wire [9:0] rr_now   = (rr_cnt == 10'd1023) ? rr_cnt : rr_cnt + 1'b1;
+    wire [7:0] refr_now = (refr != 8'd0) ? refr - 1'b1 : 8'd0;
+    wire [7:0] plen_now = plen + 1'b1;
+
+    // peak-height update when a pulse ends
+    wire signed [13:0] pk_cur_now = (hp > pk_cur) ? hp : pk_cur;
+    wire        [15:0] pk_cur_q   = {pk_cur_now[11:0], 4'b0000};
+    wire        [16:0] pk_x2      = {pk_q, 1'b0};
+    wire        [16:0] pkc_q      = ({1'b0, pk_cur_q} < pk_x2) ? {1'b0, pk_cur_q} : pk_x2;
+    wire signed [18:0] pk_diff    = $signed({2'b00, pkc_q}) - $signed({3'b000, pk_q});
+    wire signed [18:0] pk_next    = $signed({3'b000, pk_q}) + (pk_diff >>> 2);
+
+    // interval checks against the average of the stored intervals
+    wire [11:0] sum_rr  = rr0 + rr1 + rr2 + rr3;
+    wire [17:0] rr_x_n  = rr_now * rr_n;
+    wire [17:0] lhs     = rr_x_n << 3;                          // rr * n * 8
+    wire [17:0] rhs_lo  = ({6'b0, sum_rr} << 2) + sum_rr;       // sum * 5
+    wire [17:0] rhs_hi  = ({6'b0, sum_rr} << 3) + ({6'b0, sum_rr} << 2); // sum * 12
+    wire too_long  = (rr_now > RR_MAX);
+    wire too_short = (rr_n != 3'd0) && (lhs < rhs_lo);   // < 0.625 x average
+    wire too_var   = (rr_n != 3'd0) && (lhs > rhs_hi);   // > 1.5   x average
+
+    wire signed [13:0] learn_max_now = (hp > learn_max) ? hp : learn_max;
+
+    assign beat_led = (led_cnt != 23'd0);
+
+    // ---------------- main process ----------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bpm        <= 8'd0;
+            bpm_valid  <= 1'b0;
+            beat       <= 1'b0;
+            init       <= 1'b1;
+            x1 <= 12'd0; x2 <= 12'd0; x3 <= 12'd0;
+            base_acc   <= 20'd0;
+            learn_cnt  <= 10'd0;
+            learn_max  <= 14'sd0;
+            pk_q       <= 16'd0;
+            rr_cnt     <= 10'd0;
+            have_prev  <= 1'b0;
+            refr       <= 8'd0;
+            in_pulse   <= 1'b0;
+            upd        <= 1'b0;
+            plen       <= 8'd0;
+            pk_cur     <= 14'sd0;
+            rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+            rr_n       <= 3'd0;
+            rej        <= 3'd0;
+            dstate     <= D_IDLE;
+            rem        <= 17'd0;
+            den        <= 12'd0;
+            q          <= 8'd0;
+            led_cnt    <= 23'd0;
+        end else begin
+            beat <= 1'b0;
+
+            // ---- beat LED stretch (~100 ms) ----
+            if (beat)                    led_cnt <= CLK_HZ / 10;
+            else if (led_cnt != 23'd0)   led_cnt <= led_cnt - 1'b1;
+
+            // ---- BPM = n * 60 * fs / sum(intervals), by repeated subtraction ----
+            case (dstate)
+                D_IDLE: ;
+                D_LOAD: begin
+                    rem    <= rr_n * DIV_K;
+                    den    <= sum_rr;
+                    q      <= 8'd0;
+                    dstate <= D_RUN;
+                end
+                D_RUN: begin
+                    if (den != 12'd0 && rem >= den) begin
+                        rem <= rem - den;
+                        if (q != 8'd255) q <= q + 1'b1;
+                    end else begin
+                        bpm       <= (rr_n >= 3'd2) ? q : 8'd0;
+                        bpm_valid <= (rr_n >= 3'd2);
+                        dstate    <= D_IDLE;
+                    end
+                end
+                default: dstate <= D_IDLE;
+            endcase
+
+            // ---- electrodes off: forget everything ----
+            if (lo_s) begin
+                bpm       <= 8'd0;
+                bpm_valid <= 1'b0;
+                init      <= 1'b1;
+                learn_cnt <= 10'd0;
+                learn_max <= 14'sd0;
+                pk_q      <= 16'd0;
+                rr_cnt    <= 10'd0;
+                have_prev <= 1'b0;
+                refr      <= 8'd0;
+                in_pulse  <= 1'b0;
+                rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+                rr_n      <= 3'd0;
+                rej       <= 3'd0;
+                dstate    <= D_IDLE;
+
+            // ---- one pass per ADC sample ----
+            end else if (sample_valid) begin
+                // front end
+                if (init) begin
+                    x1 <= sample; x2 <= sample; x3 <= sample;
+                    init <= 1'b0;
+                end else begin
+                    x3 <= x2; x2 <= x1; x1 <= sample;
+                end
+                base_acc <= base_next[19:0];
+
+                if (learn_cnt < LEARN) begin
+                    // learning phase: find the typical R height
+                    learn_cnt <= learn_cnt + 1'b1;
+                    learn_max <= learn_max_now;
+                    if (learn_cnt == LEARN - 1) begin
+                        pk_q      <= {learn_max_now[11:0], 4'b0000};
+                        rr_cnt    <= 10'd0;
+                        have_prev <= 1'b0;
+                    end
+                end else begin
+                    rr_cnt <= rr_now;
+                    refr   <= refr_now;
+
+                    // no beat for 3 s: forget the old intervals
+                    if (rr_now >= NOBEAT && rr_n != 3'd0) begin
+                        rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+                        rr_n      <= 3'd0;
+                        bpm       <= 8'd0;
+                        bpm_valid <= 1'b0;
+                    end
+
+                    // no beat for 2 s: let the threshold fall so a weaker signal is found
+                    if (rr_now > RR_MAX && !in_pulse)
+                        pk_q <= pk_q - (pk_q >> 8);
+
+                    if (in_pulse) begin
+                        // following the R-wave until it drops below threshold
+                        plen <= plen_now;
+                        if (hp > pk_cur) pk_cur <= hp;
+                        if (hp < thr_s || plen_now >= PULSE_MAX) begin
+                            in_pulse <= 1'b0;
+                            if (upd) pk_q <= pk_next[15:0];
+                        end
+
+                    end else if (hp > thr_s && refr_now == 8'd0) begin
+                        // candidate beat
+                        refr <= REFRACT;
+
+                        if (!have_prev) begin
+                            // first beat: nothing to measure against yet
+                            have_prev <= 1'b1;
+                            rr_cnt    <= 10'd0;
+                            in_pulse <= 1'b1; plen <= 8'd0; pk_cur <= hp; upd <= 1'b1;
+                            beat     <= 1'b1;
+
+                        end else if (too_long) begin
+                            // gap too long: restart the interval history
+                            rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+                            rr_n      <= 3'd0;
+                            rej       <= 3'd0;
+                            rr_cnt    <= 10'd0;
+                            bpm       <= 8'd0;
+                            bpm_valid <= 1'b0;
+                            in_pulse <= 1'b1; plen <= 8'd0; pk_cur <= hp; upd <= 1'b1;
+                            beat     <= 1'b1;
+
+                        end else if (too_short) begin
+                            // too soon after the last beat: treat as noise / T-wave.
+                            // Ignore it (interval keeps counting from the last good beat).
+                            if (rej != 3'd0) begin
+                                // repeated mismatch: the rate really changed, re-acquire
+                                rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+                                rr_n      <= 3'd0;
+                                rej       <= 3'd0;
+                                rr_cnt    <= 10'd0;
+                                bpm       <= 8'd0;
+                                bpm_valid <= 1'b0;
+                            end else begin
+                                rej <= 3'd2;
+                            end
+
+                        end else if (too_var) begin
+                            // much longer than average: probably a missed beat.
+                            // Real beat, but do not use this interval.
+                            rr_cnt   <= 10'd0;
+                            in_pulse <= 1'b1; plen <= 8'd0; pk_cur <= hp; upd <= 1'b1;
+                            beat     <= 1'b1;
+                            if (rej != 3'd0) begin
+                                rr0 <= 10'd0; rr1 <= 10'd0; rr2 <= 10'd0; rr3 <= 10'd0;
+                                rr_n      <= 3'd0;
+                                rej       <= 3'd0;
+                                bpm       <= 8'd0;
+                                bpm_valid <= 1'b0;
+                            end else begin
+                                rej <= 3'd2;
+                            end
+
+                        end else begin
+                            // good interval: store it and recompute BPM
+                            rr3 <= rr2; rr2 <= rr1; rr1 <= rr0; rr0 <= rr_now;
+                            rr_n   <= (rr_n == 3'd4) ? 3'd4 : rr_n + 1'b1;
+                            rr_cnt <= 10'd0;
+                            rej    <= (rej != 3'd0) ? rej - 1'b1 : 3'd0;
+                            in_pulse <= 1'b1; plen <= 8'd0; pk_cur <= hp; upd <= 1'b1;
+                            beat     <= 1'b1;
+                            dstate   <= D_LOAD;
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+endmodule
