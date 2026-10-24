@@ -1,0 +1,57 @@
+# Quartus settings for accel_de0nano (DE0-Nano, onboard ADXL345)
+set_global_assignment -name FAMILY "Cyclone IV E"
+set_global_assignment -name DEVICE EP4CE22F17C6
+set_global_assignment -name TOP_LEVEL_ENTITY accel_top
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
+
+# Source files
+set_global_assignment -name VERILOG_FILE accel_top.v
+set_global_assignment -name VERILOG_FILE adxl345_ctrl.v
+set_global_assignment -name VERILOG_FILE adxl345_spi3w.v
+set_global_assignment -name VERILOG_FILE activity_detect.v
+set_global_assignment -name VERILOG_FILE serial_plot.v
+set_global_assignment -name VERILOG_FILE uart_tx.v
+set_global_assignment -name SDC_FILE accel_de0nano.sdc
+
+# Simulation (Questa/ModelSim via Tools > Run Simulation Tool)
+set_global_assignment -name EDA_SIMULATION_TOOL "ModelSim-Altera (Verilog)"
+set_global_assignment -name EDA_OUTPUT_DATA_FORMAT "VERILOG HDL" -section_id eda_simulation
+set_global_assignment -name EDA_TEST_BENCH_ENABLE_STATUS TEST_BENCH_MODE -section_id eda_simulation
+set_global_assignment -name EDA_NATIVELINK_SIMULATION_TEST_BENCH tb_accel -section_id eda_simulation
+set_global_assignment -name EDA_TEST_BENCH_NAME tb_accel -section_id eda_simulation
+set_global_assignment -name EDA_DESIGN_INSTANCE_NAME NA -section_id tb_accel
+set_global_assignment -name EDA_TEST_BENCH_MODULE_NAME tb_accel -section_id tb_accel
+set_global_assignment -name EDA_TEST_BENCH_FILE tb_accel.v -section_id tb_accel
+
+# DE0-Nano pin assignments (Terasic DE0-Nano User Manual)
+set_location_assignment PIN_R8  -to CLOCK_50
+set_location_assignment PIN_J15 -to KEY0
+set_location_assignment PIN_G5  -to G_SENSOR_CS_N
+set_location_assignment PIN_F2  -to I2C_SCLK
+set_location_assignment PIN_F1  -to I2C_SDAT
+# MOVEMENT: GPIO_0 header pin 4 (GPIO_01)
+set_location_assignment PIN_C3  -to MOVEMENT
+# UART_TXD: GPIO_0 header pin 2 (GPIO_00)
+set_location_assignment PIN_D3  -to UART_TXD
+set_location_assignment PIN_A15 -to LED[0]
+set_location_assignment PIN_A13 -to LED[1]
+set_location_assignment PIN_B13 -to LED[2]
+set_location_assignment PIN_A11 -to LED[3]
+set_location_assignment PIN_D1  -to LED[4]
+set_location_assignment PIN_F3  -to LED[5]
+set_location_assignment PIN_B1  -to LED[6]
+set_location_assignment PIN_L3  -to LED[7]
+
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to CLOCK_50
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to KEY0
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to G_SENSOR_CS_N
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to I2C_SCLK
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to I2C_SDAT
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to LED[*]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to MOVEMENT
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to UART_TXD
+
+set_global_assignment -name RESERVE_ALL_UNUSED_PINS_WEAK_PULLUP "AS INPUT TRI-STATED WITH WEAK PULL-UP"
+set_global_assignment -name STRATIX_DEVICE_IO_STANDARD "3.3-V LVTTL"

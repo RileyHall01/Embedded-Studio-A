@@ -1,0 +1,22 @@
+
+What each file is
+| File              | Purpose                                                       |
+| ----------------- | ------------------------------------------------------------- |
+| accel_top.v       | Top level (same content as FPGA_Code.txt, comments corrected) |
+| adxl345_spi3w.v   | Three-wire SPI master for the ADXL345                         |
+| adxl345_ctrl.v    | Sensor init and 100 Hz burst read, outputs X/Y/Z              |
+| activity_detect.v | Gravity cancellation, threshold, debounce, movement bit       |
+| serial_plot.v     | Formats x,y,z,moving as ASCII and drives the UART             |
+| uart_tx.v         | 8N1 UART transmitter                                          |
+| tb_accel.v        | Self-checking testbench with a simulated ADXL345              |
+| accel_de0nano.qsf | Quartus settings and DE0-Nano pin assignments                 |
+| accel_de0nano.sdc | 50 MHz timing constraint                                      |
+
+|Build
+ Open accel_de0nano.qsf in Quartus (File, Open Project, pick the .qsf) or
+ create a new project and add all .v files with accel_top as the top entity.
+ Pin assignments are in the .qsf.
+
+|Test simulation
+ iverilog -g2005 -o tb adxl345_spi3w.v adxl345_ctrl.v activity_detect.v tb_accel.v && vvp tb
+ Expect three PASS lines.
