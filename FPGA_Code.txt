@@ -28,7 +28,7 @@ module accel_top (
     // 1 = movement, 0 = stationary. GPIO_0 header pin 4 (PIN_C3).
     output wire        MOVEMENT,
 
-    // UART to PC via USB-serial adapter: GPIO_0 header pin 2 (PIN_D3), 115200 8N1
+    // UART to Arduino: GPIO_0 header pin 2 (PIN_D3), 9600 8N1
     output wire        UART_TXD
 );
 
@@ -57,7 +57,11 @@ module accel_top (
         .accel_x(ax), .accel_y(ay), .accel_z(az),
         .moving(moving), .activity_level(level)
     );
-	 
+
+
+
+
+// Send every 10th sample (10 lines/s) so 9600 baud keeps up
 	 reg [3:0] uart_sample_count = 0;
 reg uart_data_valid = 0;
 
@@ -79,7 +83,7 @@ always @(posedge CLOCK_50 or negedge rst_n) begin
     end
 end
 
-    // Streams "x,y,z,moving\n" as ASCII at 100 lines/s. moving = 0 or 200 so the
+    // Streams "x,y,z,moving\n" as ASCII at 10 lines/s. moving = 0 or 200 so the
     // flag is visible on the same axes as the accel data in a serial plotter.
     serial_plot #(
         .CLK_HZ(50_000_000), .BAUD(9600), .MOVING_LEVEL(16'd200)
